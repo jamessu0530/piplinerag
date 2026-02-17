@@ -1,75 +1,11 @@
-"""
-使用 Gemma 模型（透過 Ollama）辨識 Markdown 中的段落標題，
-將內容切成 title + text 的 chunks。
-
-可作為模組被 main 或測試程式匯入使用。
-"""
-
 import os
 import json
-import re
-import requests
-from dotenv import load_dotenv
-from typing import TypedDict
-
-
-class Chunk(TypedDict):
-    title: str
-    text: str
-
-
-SYSTEM_PROMPT = """你是一個專業的文件結構分析助手。
-你的任務是分析使用者提供的 Markdown 文字，辨識出每個段落的「標題 (title)」以及其對應的「內文 (text)」。
-
-規則：
-1. 每一個段落必須有一個 title 和一個 text。
-2. title 是段落的主題或標題（可能是 Markdown 的 # ## ### 標題，也可能是粗體文字、或段落開頭的關鍵句）。
-3. text 是該 title 底下的所有內容文字（不包含 title 本身）。
-4. 如果某段文字沒有明確標題，請根據內容自行產生一個簡短的描述性標題。
-5. 保持原文內容完整，不要省略或修改任何原文。
-
-請以下列 JSON 格式回傳結果，只回傳 JSON，不要加任何其他文字：
-[
-  {
-    "title": "段落標題",
-    "text": "段落內文..."
-  },
-  ...
-]"""
-
-
-def _extract_json_from_response(response_text: str) -> list:
-    """從模型回應中提取 JSON 陣列。"""
-    try:
-        return json.loads(response_text)
-    except json.JSONDecodeError:
-        pass
-
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", response_text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    start = response_text.find("[")
-    end = response_text.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(response_text[start : end + 1])
-        except json.JSONDecodeError:
-            pass
-
-    raise RuntimeError(
-        f"無法從模型回應中解析 JSON。\n原始回應：\n{response_text[:500]}"
-    )
-
-
+from ai_chunk_extractor import AIChunkExtractor, Chunk
+__all__ = ["Chunk", "TitleChunker"]
 def _split_markdown_roughly(text: str, max_size: int) -> list[str]:
     """將過長的 Markdown 粗略分段。"""
     segments: list[str] = []
     current = ""
-
     for line in text.split("\n"):
         if len(current) + len(line) + 1 > max_size and current.strip():
             segments.append(current)
@@ -85,8 +21,6 @@ def _split_markdown_roughly(text: str, max_size: int) -> list[str]:
 class TitleChunker:
     """使用 Gemma 模型將 Markdown 依標題切成 title + text 的 chunks。"""
 
-    DEFAULT_OLLAMA_URL = "http://localhost:11434"
-    DEFAULT_MODEL = "gemma3:4b"
     DEFAULT_MAX_SEGMENT_SIZE = 6000
 
     def __init__(
@@ -95,57 +29,12 @@ class TitleChunker:
         model: str | None = None,
         max_segment_size: int | None = None,
     ):
-        load_dotenv()
-        self.ollama_url = ollama_url or os.getenv(
-            "OLLAMA_BASE_URL", self.DEFAULT_OLLAMA_URL
-        )
-        self.model = model or os.getenv("GEMMA_MODEL", self.DEFAULT_MODEL)
+        self._ai_extractor = AIChunkExtractor(ollama_url=ollama_url, model=model)
         self.max_segment_size = max_segment_size or self.DEFAULT_MAX_SEGMENT_SIZE
 
-    def _call_gemma(self, markdown_text: str) -> str:
-        """呼叫 Ollama API，取得模型回傳內容。"""
-        resp = requests.post(
-            f"{self.ollama_url.rstrip('/')}/api/chat",
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": f"請分析以下 Markdown 文字，辨識段落標題與內文：\n\n{markdown_text}",
-                    },
-                ],
-                "stream": False,
-                "options": {
-                    "temperature": 0.1,
-                    "num_predict": 8192,
-                },
-            },
-            timeout=300,
-        )
-
-        if resp.status_code != 200:
-            raise RuntimeError(f"Ollama API 錯誤 ({resp.status_code}): {resp.text}")
-
-        return resp.json().get("message", {}).get("content", "")
-
     def _parse_segment(self, segment: str) -> list[Chunk]:
-        """對一段 Markdown 呼叫模型並解析成 chunks。"""
-        response = self._call_gemma(segment)
-        raw_chunks = _extract_json_from_response(response)
-        chunks: list[Chunk] = []
-
-        for item in raw_chunks:
-            if "title" not in item or "text" not in item:
-                continue
-            chunks.append(
-                Chunk(
-                    title=str(item["title"]).strip(),
-                    text=str(item["text"]).strip(),
-                )
-            )
-
-        return chunks
+        """對一段 Markdown 呼叫 AI 並解析成 chunks。"""
+        return self._ai_extractor.extract_chunks(segment)
 
     def chunk_from_text(self, markdown_text: str) -> list[Chunk]:
         """
